@@ -38,6 +38,28 @@ lerobot-record \\
     --display_data=true
 ```
 
+Untimed episodes, each labeled success / recovery / failure (stored in the per-frame
+``episode_label`` column: 0 / 1 / 2), with ``--manual_control=true``.  Space starts an episode,
+Space stops it, then Space / r / f saves it as success / recovery / failure; Left discards
+it and q quits.  ``episode_time_s`` and ``reset_time_s`` are ignored, and ``num_episodes``
+caps the number of saved episodes:
+
+```shell
+lerobot-record \\
+    --robot.type=so101_follower \\
+    --robot.port=/dev/ttyACM1 \\
+    --robot.id=my_follower \\
+    --teleop.type=so101_leader \\
+    --teleop.port=/dev/ttyACM0 \\
+    --teleop.id=my_leader \\
+    --dataset.repo_id=<my_username>/<my_dataset_name> \\
+    --dataset.num_episodes=50 \\
+    --dataset.single_task="Grab the cube" \\
+    --dataset.streaming_encoding=true \\
+    --dataset.encoder_threads=2 \\
+    --manual_control=true
+```
+
 To stream the data to Foxglove instead of Rerun, add ``--display_mode=foxglove`` (then connect the
 Foxglove app to ``ws://127.0.0.1:8765``; override the port with ``--display_port=<port>``).
 
@@ -90,9 +112,12 @@ lerobot-record \\
 """
 
 import logging
+import math
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
+
+import numpy as np
 
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
@@ -109,6 +134,8 @@ from lerobot.datasets import (
     create_initial_features,
     safe_stop_image_writer,
 )
+from lerobot.datasets.io_utils import load_nested_dataset
+from lerobot.datasets.utils import EPISODES_DIR
 from lerobot.processor import (
     RobotAction,
     RobotObservation,
@@ -155,10 +182,15 @@ from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.keyboard_input import init_keyboard_listener
+from lerobot.utils.keyboard_input import (
+    EPISODE_LABELS,
+    init_keyboard_listener,
+    init_labeling_keyboard_listener,
+)
 from lerobot.utils.utils import (
     init_logging,
     log_say,
+    unwrap_scalar,
 )
 from lerobot.utils.visualization_utils import (
     init_visualization,
@@ -188,6 +220,9 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Untimed, keyboard-driven episodes labeled success/recovery/failure (stored as `episode_label`).
+    # episode_time_s and reset_time_s are ignored; num_episodes caps the number of saved episodes.
+    manual_control: bool = False
 
     def __post_init__(self):
         if self.teleop is None:
@@ -246,6 +281,7 @@ def record_loop(
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
     timer: CycleTimer | None = None,
+    extra_frame: dict | None = None,
 ) -> None:
     """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
 
@@ -365,7 +401,7 @@ def record_loop(
         if dataset is not None:
             with timer.section("record"):
                 action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-                frame = {**observation_frame, **action_frame, "task": single_task}
+                frame = {**observation_frame, **action_frame, **(extra_frame or {}), "task": single_task}
                 dataset.add_frame(frame)
 
         if display_data:
@@ -380,6 +416,95 @@ def record_loop(
         timer.wait()
 
         timestamp = time.perf_counter() - start_episode_t
+
+
+def _set_episode_label(dataset: LeRobotDataset, label: int) -> None:
+    """Overwrite the placeholder label of the buffered episode before `save_episode()` stacks it."""
+    assert dataset.writer is not None and dataset.writer.episode_buffer is not None
+    buffer = dataset.writer.episode_buffer
+    buffer["episode_label"] = [np.array([label], dtype=np.int64)] * buffer["size"]
+
+
+def _existing_label_counts(dataset: LeRobotDataset) -> dict[int, int]:
+    """Per-label episode counts of an existing dataset, for resuming a manual session."""
+    counts = dict.fromkeys(EPISODE_LABELS.values(), 0)
+    if dataset.meta.total_episodes == 0:
+        return counts
+    # `meta.episodes` strips the stats columns, so read the episode metadata files directly.
+    episodes = load_nested_dataset(dataset.root / EPISODES_DIR)
+    for value in episodes["stats/episode_label/max"]:
+        counts[int(unwrap_scalar(value))] += 1
+    return counts
+
+
+_LABEL_NAMES = {v: k for k, v in EPISODE_LABELS.items()}
+
+
+def _clear_manual_events(events: dict) -> None:
+    events.update(
+        exit_early=False, rerecord_episode=False, start_episode=False, stop_episode=False, episode_label=None
+    )
+
+
+def _record_manual(
+    cfg: RecordConfig, dataset: LeRobotDataset, events: dict, timer: CycleTimer, loop_kwargs: dict
+) -> None:
+    """Untimed, keyboard-driven recording: idle -> recording -> awaiting_label -> save or discard.
+
+    Every phase runs :func:`record_loop` at the same fps with the teleop live, so the operator
+    feels no difference between them; only the recording phase writes frames.  Keys are
+    handled by :func:`~lerobot.utils.keyboard_input.init_labeling_keyboard_listener`.
+    """
+    counts = _existing_label_counts(dataset)
+    saved = 0
+    while saved < cfg.dataset.num_episodes and not events["stop_recording"]:
+        # Idle / reset: teleop live, nothing recorded. Private timer, like the timed reset phase.
+        _clear_manual_events(events)
+        events["phase"] = "idle"
+        record_loop(**loop_kwargs, control_time_s=math.inf)
+        if events["stop_recording"]:
+            break
+
+        episode_index = dataset.num_episodes
+        _clear_manual_events(events)
+        events["phase"] = "recording"
+        log_say(f"Recording episode {episode_index}", cfg.play_sounds)
+        record_loop(
+            **loop_kwargs,
+            dataset=dataset,
+            control_time_s=math.inf,
+            # Placeholder: the real label is only known once the episode has ended.
+            extra_frame={"episode_label": np.array([0], dtype=np.int64)},
+            timer=timer,
+        )
+
+        # An episode stopped before its first frame has nothing to label: treat it as discarded.
+        if dataset.has_pending_frames() and not (events["stop_recording"] or events["rerecord_episode"]):
+            _clear_manual_events(events)
+            events["phase"] = "awaiting_label"
+            logging.info("Label the episode: space=success  r=recovery  f=failure  (left=discard)")
+            record_loop(**loop_kwargs, control_time_s=math.inf)
+
+        label = events["episode_label"]
+        if label is None:  # discarded with Left, quit before labeling, or empty
+            dataset.clear_episode_buffer()
+            timer.log_episode_summary("discarded episode")
+            timer.restart()
+            if not events["stop_recording"]:
+                log_say("Discarded", cfg.play_sounds)
+            continue
+
+        _set_episode_label(dataset, label)
+        dataset.save_episode()
+        counts[label] += 1
+        saved += 1
+        timer.log_episode_summary(f"episode {episode_index}")
+        timer.restart()
+        log_say(
+            f"Saved {_LABEL_NAMES[label]}. {counts[0]} success, {counts[1]} recovery, "
+            f"{counts[2]} failure, {sum(counts.values())} total",
+            cfg.play_sounds,
+        )
 
 
 @parser.wrap()
@@ -429,6 +554,10 @@ def record(
             use_videos=cfg.dataset.video,
         ),
     )
+
+    if cfg.manual_control:
+        # Not prefixed with observation./action, so policies ignore it.
+        dataset_features["episode_label"] = {"dtype": "int64", "shape": (1,), "names": None}
 
     dataset = None
     listener = None
@@ -489,42 +618,40 @@ def record(
             teleop.connect()
         robot.connect()
 
-        listener, events = init_keyboard_listener()
+        if cfg.manual_control:
+            listener, events = init_labeling_keyboard_listener()
+        else:
+            listener, events = init_keyboard_listener()
 
         if not cfg.dataset.streaming_encoding:
-            logging.info(
+            # In manual mode teleop never pauses between episodes, except while `save_episode`
+            # encodes the video, so the hint is upgraded to a warning there.
+            log = logging.warning if cfg.manual_control else logging.info
+            log(
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.rgb_encoder.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
         with VideoEncodingManager(dataset):
-            recorded_episodes = 0
-            while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                episode_index = dataset.num_episodes
-                log_say(f"Recording episode {episode_index}", cfg.play_sounds)
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=cfg.dataset.fps,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                    display_mode=cfg.display_mode,
-                    display_compressed_images=display_compressed_images,
-                    timer=timer,
-                )
-
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
-
+            if cfg.manual_control:
+                loop_kwargs = {
+                    "robot": robot,
+                    "events": events,
+                    "fps": cfg.dataset.fps,
+                    "teleop_action_processor": teleop_action_processor,
+                    "robot_action_processor": robot_action_processor,
+                    "robot_observation_processor": robot_observation_processor,
+                    "teleop": teleop,
+                    "single_task": cfg.dataset.single_task,
+                    "display_data": cfg.display_data,
+                    "display_mode": cfg.display_mode,
+                    "display_compressed_images": display_compressed_images,
+                }
+                _record_manual(cfg, dataset, events, timer, loop_kwargs)
+            else:
+                recorded_episodes = 0
+                while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                    episode_index = dataset.num_episodes
+                    log_say(f"Recording episode {episode_index}", cfg.play_sounds)
                     record_loop(
                         robot=robot,
                         events=events,
@@ -533,31 +660,55 @@ def record(
                         robot_action_processor=robot_action_processor,
                         robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
+                        dataset=dataset,
+                        control_time_s=cfg.dataset.episode_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         display_mode=cfg.display_mode,
                         display_compressed_images=display_compressed_images,
+                        timer=timer,
                     )
 
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    timer.log_episode_summary("discarded episode")
-                    timer.restart()
-                    continue
+                    # Execute a few seconds without recording to give time to manually reset the environment
+                    # Skip reset for the last episode to be recorded
+                    if not events["stop_recording"] and (
+                        (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                    ):
+                        log_say("Reset the environment", cfg.play_sounds)
 
-                dataset.save_episode()
-                recorded_episodes += 1
-                # Close the window on the episode just saved.  The digest is emitted on
-                # the next episode's first tick, so the reset phase, `save_episode` and
-                # the spoken prompts in between are excluded from the cadence instead of
-                # being charged to whichever episode they sit next to.  `restart()` then
-                # exempts that first tick, whose cameras have been idle for seconds.
-                timer.log_episode_summary(f"episode {episode_index}")
-                timer.restart()
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                            display_mode=cfg.display_mode,
+                            display_compressed_images=display_compressed_images,
+                        )
+
+                    if events["rerecord_episode"]:
+                        log_say("Re-record episode", cfg.play_sounds)
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+                        dataset.clear_episode_buffer()
+                        timer.log_episode_summary("discarded episode")
+                        timer.restart()
+                        continue
+
+                    dataset.save_episode()
+                    recorded_episodes += 1
+                    # Close the window on the episode just saved.  The digest is emitted on
+                    # the next episode's first tick, so the reset phase, `save_episode` and
+                    # the spoken prompts in between are excluded from the cadence instead of
+                    # being charged to whichever episode they sit next to.  `restart()` then
+                    # exempts that first tick, whose cameras have been idle for seconds.
+                    timer.log_episode_summary(f"episode {episode_index}")
+                    timer.restart()
     finally:
         # First, and in `finally`: ^C is how most recording sessions end, and the summary
         # is most useful before the video encoding and the hub upload scroll it away.

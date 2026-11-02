@@ -136,6 +136,18 @@ lerobot-record \
 
 `lerobot-record` appends the session's date and time to the repo id, so the dataset is saved as `${HF_USER}/my_task_YYYYMMDD_HHMMSS`. Find the full name on the user's Hub profile or with `ls ~/.cache/huggingface/lerobot/${HF_USER}`, and use it in the steps below (or pass `--dataset.no_stamp=true` to keep the exact name).
 
+**4.6b Untimed, labeled episodes** — add `--manual_control=true` (plus `--dataset.streaming_encoding=true --dataset.encoder_threads=2`, otherwise each save pauses the teleop while the video encodes). There are no timers: `episode_time_s` / `reset_time_s` are ignored and `num_episodes` only caps the number of saved episodes. The teleop stays live in every phase.
+
+| Phase                          | Key                 | Effect                                   |
+| ------------------------------ | ------------------- | ---------------------------------------- |
+| idle / reset                   | `Space`             | start recording                          |
+| recording                      | `Space`             | stop, then wait for a label              |
+| waiting for label              | `Space` / `r` / `f` | save as success / recovery / failure     |
+| recording or waiting for label | `←`                 | discard, back to idle                    |
+| any                            | `Esc` / `q`         | quit (an unlabeled episode is discarded) |
+
+Each frame gets an `episode_label` column (0 = success, 1 = recovery, 2 = failure). Policies ignore it (it isn't an `observation.*` / `action` key), so use it to filter, e.g. `ds.hf_dataset.filter(lambda x: x["episode_label"] == 0)`. `--resume=true` only works on a dataset recorded in this mode, and the spoken counts continue from it.
+
 **4.7 Visualize** — **always** do this before training. Look for missing frames, camera blur, unreachable targets, inconsistent object positions.
 After upload: https://huggingface.co/spaces/lerobot/visualize_dataset → paste `${HF_USER}/my_task_YYYYMMDD_HHMMSS`. Works for **any LeRobot-formatted Hub dataset** — use it to scout other datasets, inspect episode quality, or debug your own data before retraining.
 

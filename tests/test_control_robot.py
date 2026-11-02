@@ -23,12 +23,15 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 pytest.importorskip("deepdiff", reason="deepdiff is required (install lerobot[hardware])")
 
 from lerobot.configs.dataset import DatasetRecordConfig
+from lerobot.datasets.io_utils import load_nested_dataset
+from lerobot.datasets.utils import EPISODES_DIR
 from lerobot.processor import make_default_processors
 from lerobot.robots import make_robot_from_config
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
-from lerobot.scripts.lerobot_record import RecordConfig, record, record_loop
+from lerobot.scripts.lerobot_record import RecordConfig, _existing_label_counts, record, record_loop
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
+from lerobot.utils.utils import unwrap_scalar
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleopConfig
@@ -255,3 +258,97 @@ def test_record_loop_without_a_teleoperator_paces_and_terminates():
 
     # 0.1 s at 30 Hz is 3 ticks; the upper bound is what proves the phase was paced.
     assert 1 <= calls <= 6
+
+
+def _run_manual_session(cfg: RecordConfig, label_keys: list[str]):
+    """Drive `record(cfg)` in manual mode, pressing keys from inside `record_loop`.
+
+    Idle presses Space, recording runs for 0.1 s (ending a phase is what Space does), and
+    each label phase presses the next key of *label_keys*.
+    """
+    dispatch = {}
+    keys = iter(label_keys)
+
+    def fake_create_key_listener(on_key, **_):
+        dispatch["on_key"] = on_key
+        return None
+
+    def fake_record_loop(**kwargs):
+        phase = kwargs["events"]["phase"]
+        if phase == "idle":
+            dispatch["on_key"]("space")
+        elif phase == "recording":
+            record_loop(**{**kwargs, "control_time_s": 0.1})
+        else:
+            dispatch["on_key"](next(keys))
+
+    with (
+        patch("lerobot.utils.keyboard_input.create_key_listener", side_effect=fake_create_key_listener),
+        patch("lerobot.scripts.lerobot_record.record_loop", side_effect=fake_record_loop),
+    ):
+        return record(cfg)
+
+
+def _episode_labels(root) -> list[int]:
+    episodes = load_nested_dataset(root / EPISODES_DIR)
+    return [int(unwrap_scalar(v)) for v in episodes["stats/episode_label/max"]]
+
+
+def test_record_manual_labels_episodes_and_resumes_counts(tmp_path):
+    root = tmp_path / "manual"
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=root,
+        num_episodes=3,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=dataset_cfg,
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+        manual_control=True,
+    )
+
+    # success, discarded, recovery, failure
+    dataset = _run_manual_session(cfg, ["space", "left", "r", "f"])
+
+    assert dataset.meta.total_episodes == 3
+    assert dataset.meta.total_tasks == 1
+    assert _episode_labels(root) == [0, 1, 2]
+
+    cfg.resume = True
+    cfg.dataset.num_episodes = 1
+    with (
+        patch("lerobot.datasets.dataset_metadata.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.dataset_metadata.snapshot_download") as mock_snapshot_download,
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+        mock_snapshot_download.return_value = str(root)
+        dataset = _run_manual_session(cfg, ["r"])
+
+    assert dataset.meta.total_episodes == 4
+    assert _episode_labels(root) == [0, 1, 2, 1]
+    assert _existing_label_counts(dataset) == {0: 1, 1: 2, 2: 1}
+
+
+def test_record_manual_quit_while_awaiting_label_discards_the_episode(tmp_path):
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "manual_quit",
+        num_episodes=3,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=dataset_cfg,
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+        manual_control=True,
+    )
+
+    dataset = _run_manual_session(cfg, ["space", "q"])
+
+    assert dataset.meta.total_episodes == 1

@@ -30,10 +30,12 @@ import pytest
 
 import lerobot.utils.keyboard_input as ki
 from lerobot.utils.keyboard_input import (
+    EPISODE_LABELS,
     TerminalKeyListener,
     apply_recording_control,
     create_key_listener,
     init_keyboard_listener,
+    init_labeling_keyboard_listener,
     is_headless,
     is_wayland,
     pynput_can_capture,
@@ -226,3 +228,55 @@ def test_create_key_listener_none_without_tty(monkeypatch):
     monkeypatch.setattr(ki, "pynput_can_capture", lambda: False)
     _set_tty(monkeypatch, is_tty=False)
     assert create_key_listener(lambda name: None) is None
+
+
+# --- Labeling listener (lerobot-record --manual_control=true) -----------------
+def _labeling_events(monkeypatch, phase):
+    """Labeling listener on the terminal backend, without touching the TTY, set to *phase*."""
+    monkeypatch.setattr(ki, "pynput_can_capture", lambda: False)
+    _set_tty(monkeypatch, is_tty=True)
+    monkeypatch.setattr(TerminalKeyListener, "start", lambda self: None)
+    listener, events = init_labeling_keyboard_listener()
+    events["phase"] = phase
+    return listener._on_key, events
+
+
+@pytest.mark.parametrize(
+    "phase,key,flags",
+    [
+        ("idle", "space", {"start_episode": True, "exit_early": True}),
+        ("recording", "space", {"stop_episode": True, "exit_early": True}),
+        ("recording", "left", {"rerecord_episode": True, "exit_early": True}),
+        ("awaiting_label", "space", {"episode_label": EPISODE_LABELS["success"], "exit_early": True}),
+        ("awaiting_label", "r", {"episode_label": EPISODE_LABELS["recovery"], "exit_early": True}),
+        ("awaiting_label", "F", {"episode_label": EPISODE_LABELS["failure"], "exit_early": True}),
+        ("awaiting_label", "left", {"rerecord_episode": True, "exit_early": True}),
+        ("idle", "q", {"stop_recording": True, "exit_early": True}),
+        ("recording", "esc", {"stop_recording": True, "exit_early": True}),
+        ("awaiting_label", "q", {"stop_recording": True, "exit_early": True}),
+    ],
+)
+def test_labeling_listener_key_routing(monkeypatch, phase, key, flags):
+    on_key, events = _labeling_events(monkeypatch, phase)
+    before = dict(events)
+    on_key(key)
+    assert events == {**before, **flags}
+
+
+@pytest.mark.parametrize(
+    "phase,key",
+    [
+        ("idle", "left"),  # nothing to discard yet
+        ("idle", "r"),
+        ("idle", "n"),
+        ("recording", "r"),  # r/f only label once the episode has stopped
+        ("recording", "n"),
+        ("recording", "right"),
+        ("awaiting_label", "n"),
+    ],
+)
+def test_labeling_listener_ignores_keys_outside_their_phase(monkeypatch, phase, key):
+    on_key, events = _labeling_events(monkeypatch, phase)
+    before = dict(events)
+    on_key(key)
+    assert events == before
