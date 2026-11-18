@@ -15,23 +15,35 @@
 # limitations under the License.
 import logging
 import math
+from collections.abc import Sequence
+from pathlib import Path
 from pprint import pformat
 from typing import Literal, cast
 
+import numpy as np
 import torch
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
-from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFIX, OBS_STATE, REWARD
+from lerobot.utils.constants import (
+    ACTION,
+    EPISODE_LABELS,
+    IMAGENET_STATS,
+    OBS_IMAGE,
+    OBS_PREFIX,
+    OBS_STATE,
+    REWARD,
+)
 
 from .dataset_metadata import LeRobotDatasetMetadata
+from .io_utils import load_nested_dataset
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .storage import DEFAULT_STORAGE_FORMAT, is_bucket_root, load_dataset_metadata
 from .streaming_dataset import DEFAULT_STREAMING_SEED, StreamingLeRobotDataset
-from .utils import resolve_episode_indices
+from .utils import EPISODES_DIR, resolve_episode_indices
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +117,24 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
+def episodes_with_labels(root: Path, labels: Sequence[str]) -> list[int]:
+    """Indices of the episodes whose `episode_label` (see `lerobot-record --manual_control`) is in `labels`."""
+    # `meta.episodes` strips the stats columns, so read the episode metadata files directly.
+    episodes = load_nested_dataset(Path(root) / EPISODES_DIR)
+    column = "stats/episode_label/max"
+    if column not in episodes.column_names:
+        raise ValueError(
+            "dataset.exclude_labels needs an `episode_label` feature, which this dataset lacks. "
+            "Record it with `lerobot-record --manual_control=true`."
+        )
+    wanted = {EPISODE_LABELS[label] for label in labels}
+    return [
+        int(ep_idx)
+        for ep_idx, value in zip(episodes["episode_index"], episodes[column], strict=True)
+        if int(np.asarray(value).reshape(-1)[0]) in wanted
+    ]
+
+
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
@@ -141,9 +171,15 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
             repo_type=repo_type,
         )
         delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta, cfg.rename_map)
-        episodes = resolve_episode_indices(
-            cfg.dataset.episodes, ds_meta.total_episodes, cfg.dataset.exclude_episodes
-        )
+        exclude_episodes = list(cfg.dataset.exclude_episodes or [])
+        if cfg.dataset.exclude_labels:
+            labeled = episodes_with_labels(ds_meta.root, cfg.dataset.exclude_labels)
+            logger.info(
+                f"Excluding {len(labeled)}/{ds_meta.total_episodes} episodes labeled "
+                f"{', '.join(cfg.dataset.exclude_labels)}"
+            )
+            exclude_episodes.extend(labeled)
+        episodes = resolve_episode_indices(cfg.dataset.episodes, ds_meta.total_episodes, exclude_episodes)
         if cfg.dataset.streaming and ds_meta.storage_format != DEFAULT_STORAGE_FORMAT:
             raise ValueError(
                 f"dataset.streaming=True is not supported for storage_format="

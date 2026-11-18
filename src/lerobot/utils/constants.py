@@ -124,3 +124,6 @@ LIBERO_KEY_JOINTS_POS = "robot_state/joints/pos"
 LIBERO_KEY_JOINTS_VEL = "robot_state/joints/vel"
 LIBERO_KEY_PIXELS_AGENTVIEW = "pixels/agentview_image"
 LIBERO_KEY_PIXELS_EYE_IN_HAND = "pixels/robot0_eye_in_hand_image"
+
+# Values of the per-frame ``episode_label`` column written by ``lerobot-record --manual_control=true``.
+EPISODE_LABELS = {"success": 0, "recovery": 1, "failure": 2}

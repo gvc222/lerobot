@@ -146,7 +146,7 @@ lerobot-record \
 | recording or waiting for label | `←`                 | discard, back to idle                    |
 | any                            | `Esc` / `q`         | quit (an unlabeled episode is discarded) |
 
-Each frame gets an `episode_label` column (0 = success, 1 = recovery, 2 = failure). Policies ignore it (it isn't an `observation.*` / `action` key), so use it to filter, e.g. `ds.hf_dataset.filter(lambda x: x["episode_label"] == 0)`. `--resume=true` only works on a dataset recorded in this mode, and the spoken counts continue from it.
+Each frame gets an `episode_label` column (0 = success, 1 = recovery, 2 = failure). Policies ignore it (it isn't an `observation.*` / `action` key), so use it to filter: `lerobot-train ... --dataset.exclude_labels=[recovery,failure]` trains on the success episodes only. `--resume=true` only works on a dataset recorded in this mode, and the spoken counts continue from it.
 
 **4.7 Visualize** — **always** do this before training. Look for missing frames, camera blur, unreachable targets, inconsistent object positions.
 After upload: https://huggingface.co/spaces/lerobot/visualize_dataset → paste `${HF_USER}/my_task_YYYYMMDD_HHMMSS`. Works for **any LeRobot-formatted Hub dataset** — use it to scout other datasets, inspect episode quality, or debug your own data before retraining.

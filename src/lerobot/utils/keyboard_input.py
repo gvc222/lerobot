@@ -48,6 +48,7 @@ from collections.abc import Callable
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
+from .constants import EPISODE_LABELS
 from .import_utils import _pynput_available
 
 logger = logging.getLogger(__name__)
@@ -441,10 +442,6 @@ def init_keyboard_listener():
 
     listener = create_key_listener(on_key, controls_help="Right/Left/Esc, or n=next, r=re-record, q=quit")
     return listener, events
-
-
-# Values of the per-frame ``episode_label`` column written by ``lerobot-record --manual_control=true``.
-EPISODE_LABELS = {"success": 0, "recovery": 1, "failure": 2}
 
 
 def init_labeling_keyboard_listener():

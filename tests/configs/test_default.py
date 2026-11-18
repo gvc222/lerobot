@@ -108,3 +108,10 @@ def test_dataset_config_eval_split():
     DatasetConfig(repo_id="user/repo", repo_type="bucket", eval_split=0.1)
     with pytest.raises(ValueError, match="streaming"):
         DatasetConfig(repo_id="user/repo", streaming=True, eval_split=0.1)
+
+
+def test_dataset_config_exclude_labels():
+    config = draccus.parse(DatasetConfig, args=["--repo_id=user/repo", "--exclude_labels=[recovery,failure]"])
+    assert config.exclude_labels == ["recovery", "failure"]
+    with pytest.raises(ValueError, match="exclude_labels"):
+        DatasetConfig(repo_id="user/repo", exclude_labels=["recovered"])

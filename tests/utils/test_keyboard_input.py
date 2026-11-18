@@ -29,8 +29,8 @@ import sys
 import pytest
 
 import lerobot.utils.keyboard_input as ki
+from lerobot.utils.constants import EPISODE_LABELS
 from lerobot.utils.keyboard_input import (
-    EPISODE_LABELS,
     TerminalKeyListener,
     apply_recording_control,
     create_key_listener,

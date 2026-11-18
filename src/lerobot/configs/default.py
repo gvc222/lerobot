@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 from lerobot.streaming.episode_pool import StreamingSamplingStrategy
 from lerobot.transforms import ImageTransformsConfig
+from lerobot.utils.constants import EPISODE_LABELS
 from lerobot.utils.import_utils import get_safe_default_video_backend
 
 from .video import DEFAULT_DEPTH_UNIT, DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT
@@ -44,6 +45,9 @@ class DatasetConfig:
     episodes: list[int] | None = None
     # Episode indices to drop (e.g. corrupt or heterogeneous ones). Applied on top of `episodes`.
     exclude_episodes: list[int] | None = None
+    # Episode labels to drop (any of "success", "recovery", "failure"), read from the `episode_label`
+    # column written by `lerobot-record --manual_control=true`. Applied on top of `episodes`.
+    exclude_labels: list[str] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
@@ -89,6 +93,11 @@ class DatasetConfig:
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
             raise ValueError(
                 f"depth_output_unit must be '{DEPTH_METER_UNIT}' or '{DEPTH_MILLIMETER_UNIT}', got {self.depth_output_unit!r}"
+            )
+        unknown_labels = set(self.exclude_labels or []) - EPISODE_LABELS.keys()
+        if unknown_labels:
+            raise ValueError(
+                f"exclude_labels must be among {sorted(EPISODE_LABELS)}, got unknown {sorted(unknown_labels)}"
             )
         if not (0.0 <= self.eval_split < 1.0):
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
