@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hugging Face look for ``run-gui``.
+"""Hugging Face look for ``lerobot-run-gui``.
 
 Brand colors from https://huggingface.co/brand (yellow, orange, gray); the neutrals around them are
 the gray scale the huggingface.co site pairs them with.
@@ -49,8 +49,8 @@ PHASE_COLORS = {
     "starting": (HF_GRAY, WHITE),
     "ready": (HF_YELLOW, TEXT),
     "recording": (RED, WHITE),
-    "label": (HF_ORANGE, TEXT),
     "reset": (HF_YELLOW, TEXT),
+    "replaying": (HF_ORANGE, TEXT),
     "stopping": (HF_GRAY, WHITE),
 }
 
@@ -131,13 +131,14 @@ def apply_theme(root: tk.Tk) -> Fonts:
     root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
     root.option_add("*TCombobox*Listbox.font", fonts.body)
 
-    style.configure("TCheckbutton", background=WHITE, indicatorbackground=WHITE, indicatorforeground=TEXT)
-    style.map(
-        "TCheckbutton",
-        background=[("active", WHITE)],
-        indicatorbackground=[("selected", HF_YELLOW), ("disabled", DISABLED_BG)],
-        foreground=[("disabled", DISABLED_TEXT)],
-    )
+    for widget in ("TCheckbutton", "TRadiobutton"):
+        style.configure(widget, background=WHITE, indicatorbackground=WHITE, indicatorforeground=TEXT)
+        style.map(
+            widget,
+            background=[("active", WHITE)],
+            indicatorbackground=[("selected", HF_YELLOW), ("disabled", DISABLED_BG)],
+            foreground=[("disabled", DISABLED_TEXT)],
+        )
 
     button: dict[str, Any] = {"borderwidth": 0, "focusthickness": 0, "padding": (20, 9), "font": fonts.bold}
     style.configure("Primary.TButton", background=HF_YELLOW, foreground=TEXT, **button)

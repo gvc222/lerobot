@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A Tk window that launches ``lerobot-record`` for teleoperated data collection.
+"""A Tk window that launches ``lerobot-record`` or ``lerobot-replay``.
 
-Run it with ``run-gui``.  Fill in the session (operator, dataset name, task), pick the robot and
+Run it with ``lerobot-run-gui``.  Fill in the session (operator, dataset name, task), pick the robot and
 teleoperator types, check the ports / ids / cameras / episode settings (pre-filled from
 :mod:`lerobot.gui.defaults`), choose manual mode and/or auto-upload, and press Start.
 
@@ -24,6 +24,10 @@ goes to the terminal pane at the bottom, which can be dragged taller or maximize
 Ctrl+C, so it finalizes the dataset (and uploads it when auto-upload is on) exactly as a terminal
 Ctrl+C would.  The operator name is stored as an ``operator:<name>`` Hub tag and in a
 ``gui_session.json`` file at the dataset root.
+
+The Replay tab runs ``lerobot-replay`` the same way: pick the robot, a dataset repo id (on the Hub or
+already in the local cache) and an episode, and press Start.  It shares the robot fields with the
+recording form and shows no camera feeds; Stop sends Ctrl+C.
 """
 
 from __future__ import annotations
@@ -56,20 +60,27 @@ from .form import (
     PHASE_READY,
     PHASE_STARTING,
     PHASE_STOPPING,
+    REPLAY_HELP,
     STREAM_HOST,
     TIMED_KEYS_HELP,
+    Announcer,
     FormValues,
+    ReplayValues,
     build_record_command,
+    build_replay_command,
     clean_log_line,
     form_error,
     load_type_choices,
     make_repo_id,
     parse_form,
+    parse_replay_form,
     phase_from_log,
+    replay_form_error,
     resolve_hf_user,
     suggested_mount,
     write_session_file,
 )
+from .voice import Voice
 
 if TYPE_CHECKING:
     import tkinter as tk
@@ -78,10 +89,13 @@ if TYPE_CHECKING:
     from PIL import Image
 
 RENDER_INTERVAL_MS = 66  # ~15 fps, the rate lerobot-record streams at
+MODE_RECORD = "record"
+MODE_REPLAY = "replay"
+SUBTITLES = {MODE_RECORD: "Teleoperated data collection", MODE_REPLAY: "Replay a recorded episode"}
 
 
 def _echo(text: str) -> None:
-    """Write *text* to the terminal ``run-gui`` was launched from (if any)."""
+    """Write *text* to the terminal ``lerobot-run-gui`` was launched from (if any)."""
     if sys.stdout is None:  # launched without a console
         return
     try:
@@ -133,7 +147,7 @@ class _CameraTile:
 
 
 class TeleopGui:
-    """The recorder window; runs one ``lerobot-record`` subprocess at a time."""
+    """The recorder window; runs one ``lerobot-record`` or ``lerobot-replay`` subprocess at a time."""
 
     def __init__(self, defaults: GuiDefaults = DEFAULTS) -> None:
         """Build the widgets and start the Hugging Face / type-list lookups in the background."""
@@ -146,7 +160,10 @@ class TeleopGui:
         self.hf_user: str | None = None
         self.proc: subprocess.Popen[str] | None = None
         self.lines: queue.Queue[str | None] = queue.Queue()
+        # Exactly one of these is set during a run, depending on the mode it was started in.
         self.run_values: FormValues | None = None
+        self.run_replay: ReplayValues | None = None
+        self.run_tool = "lerobot-record"
         self.run_repo_id = ""
         self.run_started_at = datetime.now()
         self.terminal_maximized = False
@@ -156,6 +173,8 @@ class TeleopGui:
         self.stream_stop = threading.Event()
         self.tiles: list[_CameraTile] = []
         self.phase = PHASE_STARTING
+        self.voice = Voice()
+        self.announcer = Announcer()
 
         self.root = tk.Tk()
         self.root.title("LeRobot Recorder")
@@ -171,6 +190,7 @@ class TeleopGui:
             "task": tk.StringVar(),
             "manual_control": tk.BooleanVar(value=False),
             "push_to_hub": tk.BooleanVar(value=True),
+            "voice": tk.BooleanVar(value=d.voice),
             "robot_type": tk.StringVar(value=d.robot_type),
             "robot_port": tk.StringVar(value=d.robot_port),
             "robot_id": tk.StringVar(value=d.robot_id),
@@ -180,9 +200,14 @@ class TeleopGui:
             "num_episodes": tk.StringVar(value=str(d.num_episodes)),
             "episode_time_s": tk.StringVar(value=f"{d.episode_time_s:g}"),
             "reset_time_s": tk.StringVar(value=f"{d.reset_time_s:g}"),
+            "replay_repo_id": tk.StringVar(),
+            "replay_episode": tk.StringVar(value="0"),
         }
         for var in self.vars.values():
             var.trace_add("write", lambda *_: self._refresh())
+        self.mode = tk.StringVar(value=MODE_RECORD)
+        self.mode.trace_add("write", lambda *_: self._on_mode_change())
+        self.subtitle = tk.StringVar(value=SUBTITLES[MODE_RECORD])
         self.status = tk.StringVar()
         self.user_text = tk.StringVar(value="Checking Hugging Face login...")
         self.inputs: list[ttk.Widget] = []
@@ -194,9 +219,12 @@ class TeleopGui:
         self.top = ttk.Frame(self.paned, padding=(16, 8, 16, 6))
         self.paned.add(self.top, weight=4)
         self._build_terminal()
+        self._build_mode_switch(self.top)
         self.setup_view = ttk.Frame(self.top)
+        self.replay_view = ttk.Frame(self.top)
         self.live_view = ttk.Frame(self.top)
         self._build_setup_view(self.setup_view)
+        self._build_replay_view(self.replay_view)
         self._build_live_view(self.live_view)
         self.setup_view.pack(fill="both", expand=True)
 
@@ -214,7 +242,7 @@ class TeleopGui:
         header = ttk.Frame(self.root, padding=(20, 14, 20, 12))
         header.pack(fill="x")
         ttk.Label(header, text="LeRobot Recorder", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="Teleoperated data collection", style="Muted.TLabel").pack(
+        ttk.Label(header, textvariable=self.subtitle, style="Muted.TLabel").pack(
             side="left", padx=(12, 0), pady=(6, 0)
         )
         ttk.Label(header, textvariable=self.user_text, style="Muted.TLabel").pack(side="right", pady=(6, 0))
@@ -238,6 +266,16 @@ class TeleopGui:
         self.status_label.pack(anchor="w")
         self.hint = ttk.Label(text, style="Muted.TLabel")
         self.hint.pack(anchor="w")
+
+    def _build_mode_switch(self, parent: ttk.Frame) -> None:
+        from tkinter import ttk
+
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", padx=5, pady=(0, 6))
+        for text, mode in [("Record", MODE_RECORD), ("Replay", MODE_REPLAY)]:
+            button = ttk.Radiobutton(bar, text=text, value=mode, variable=self.mode, takefocus=0)
+            button.pack(side="left", padx=(0, 16))
+            self.inputs.append(button)
 
     def _build_terminal(self) -> None:
         import tkinter as tk
@@ -361,11 +399,28 @@ class TeleopGui:
 
         mode = self._section(parent, "Mode", row=3, column=1)
         for row, (text, key) in enumerate(
-            [("Manual mode", "manual_control"), ("Auto-upload to Hugging Face", "push_to_hub")]
+            [
+                ("Manual mode", "manual_control"),
+                ("Auto-upload to Hugging Face", "push_to_hub"),
+                ("Voice announcements", "voice"),
+            ]
         ):
             check = ttk.Checkbutton(mode, text=text, variable=self.vars[key], takefocus=0)
             check.grid(row=row, column=0, sticky="w", pady=6)
             self.inputs.append(check)
+
+    def _build_replay_view(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1, uniform="col")
+        parent.columnconfigure(1, weight=1, uniform="col")
+
+        dataset = self._section(parent, "Dataset", row=0, column=0)
+        self._entry(dataset, 0, "Repo ID", "replay_repo_id")
+        self._entry(dataset, 1, "Episode", "replay_episode")
+
+        robot = self._section(parent, "Robot  ·  follower", row=0, column=1)
+        self.replay_robot_type_box = self._dropdown(robot, 0, "Type", "robot_type")
+        self._entry(robot, 1, "Port", "robot_port")
+        self._entry(robot, 2, "ID", "robot_id")
 
     def _build_live_view(self, parent: ttk.Frame) -> None:
         import tkinter as tk
@@ -484,6 +539,13 @@ class TeleopGui:
             return None, str(e)
         return values, form_error(values, self.hf_user)
 
+    def _read_replay_form(self) -> tuple[ReplayValues | None, str | None]:
+        try:
+            values = parse_replay_form({key: var.get() for key, var in self.vars.items()})
+        except ValueError as e:
+            return None, str(e)
+        return values, replay_form_error(values)
+
     def _lookup_hf_user(self) -> None:
         user = resolve_hf_user()
         self.root.after(0, self._set_hf_user, user)
@@ -508,6 +570,7 @@ class TeleopGui:
     def _set_type_choices(self, robots: list[str], teleops: list[str]) -> None:
         for box, choices, key in [
             (self.robot_type_box, robots, "robot_type"),
+            (self.replay_robot_type_box, robots, "robot_type"),
             (self.teleop_type_box, teleops, "teleop_type"),
         ]:
             current = self.vars[key].get()
@@ -516,6 +579,10 @@ class TeleopGui:
     def _refresh(self) -> None:
         if self.proc is not None or not hasattr(self, "episodes_note"):
             return
+        if self.mode.get() == MODE_REPLAY:
+            self._refresh_replay()
+            return
+        self.button.configure(text="Start recording")
         manual = bool(self.vars["manual_control"].get())
         self.hint.configure(text=MANUAL_KEYS_HELP if manual else TIMED_KEYS_HELP)
         # Manual episodes are untimed and uncapped: the episode settings don't apply.
@@ -535,6 +602,17 @@ class TeleopGui:
         else:
             self._set_status("Fill in the operator, dataset name and task to start.")
 
+    def _refresh_replay(self) -> None:
+        self.hint.configure(text=REPLAY_HELP)
+        values, error = self._read_replay_form()
+        self.button.configure(text="Start replay", state="disabled" if error else "normal")
+        if values is not None and not error:
+            self._set_status(f"Ready to replay episode {values.episode} of {values.repo_id}")
+        elif error and self.vars["replay_repo_id"].get():
+            self._set_status(error, error=True)
+        else:
+            self._set_status("Enter a dataset repo id and an episode to start.")
+
     def _set_status(self, text: str, error: bool = False) -> None:
         self.status.set(text)
         self.status_label.configure(style="Error.TLabel" if error else "Status.TLabel")
@@ -546,12 +624,22 @@ class TeleopGui:
 
     # ---- views -----------------------------------------------------------------------------
 
-    def _show_live_view(self, values: FormValues) -> None:
+    def _form_view(self) -> ttk.Frame:
+        return self.replay_view if self.mode.get() == MODE_REPLAY else self.setup_view
+
+    def _on_mode_change(self) -> None:
+        for view in (self.setup_view, self.replay_view):
+            view.pack_forget()
+        self._form_view().pack(fill="both", expand=True)
+        self.subtitle.set(SUBTITLES[self.mode.get()])
+        self._refresh()
+
+    def _show_live_view(self, cameras: dict[str, Any], label: str, message: str) -> None:
         for tile in self.tiles:
             tile.frame.destroy()
         self.tiles = []
         self.frames = {}
-        names = list(values.cameras)
+        names = list(cameras)
         columns = 1 if len(names) <= 1 else 2 if len(names) <= 4 else 3
         rows = max(1, -(-len(names) // columns))
         for c in range(3):
@@ -561,16 +649,18 @@ class TeleopGui:
             used = r < rows
             self.tiles_frame.rowconfigure(r, weight=int(used), uniform="tile" if used else "")
         for i, name in enumerate(names):
-            cam = values.cameras[name]
+            cam = cameras[name]
             caption = f"{name}   ·   {cam.mount}   ·   {cam.width}×{cam.height}"
             tile = _CameraTile(self, self.tiles_frame, name, caption)
             tile.frame.grid(row=i // columns, column=i % columns, sticky="nsew", padx=6, pady=6)
             self.tiles.append(tile)
         if not names:
-            self.ttk.Label(self.tiles_frame, text="No cameras configured.", style="Muted.TLabel").grid()
-        self.live_repo.configure(text=self.run_repo_id)
-        self._set_phase(PHASE_STARTING, "Connecting to the robot and cameras...")
+            empty = "Replay doesn't use the cameras." if self.run_replay else "No cameras configured."
+            self.ttk.Label(self.tiles_frame, text=empty, style="Muted.TLabel").grid()
+        self.live_repo.configure(text=label)
+        self._set_phase(PHASE_STARTING, message)
         self.setup_view.pack_forget()
+        self.replay_view.pack_forget()
         self.live_view.pack(fill="both", expand=True)
 
     def _show_setup_view(self) -> None:
@@ -578,7 +668,7 @@ class TeleopGui:
         for child in self.tiles_frame.winfo_children():
             child.destroy()
         self.tiles = []
-        self.setup_view.pack(fill="both", expand=True)
+        self._form_view().pack(fill="both", expand=True)
 
     def _set_phase(self, phase: str, message: str) -> None:
         self.phase = phase
@@ -649,28 +739,28 @@ class TeleopGui:
             and self.run_values.manual_control
         ):
             self._set_phase(PHASE_READY, "Press Space to start an episode")
+            self._say("Ready. Press space to start recording")
         self.root.after(RENDER_INTERVAL_MS, self._render_frames)
 
     # ---- recording -------------------------------------------------------------------------
 
     def _on_button(self) -> None:
-        if self.proc is None:
-            self._start()
-        else:
+        if self.proc is not None:
             self._stop()
+        elif self.mode.get() == MODE_REPLAY:
+            self._start_replay()
+        else:
+            self._start()
 
-    def _start(self) -> None:
-        values, error = self._read_form()
-        if values is None or error:
-            return
-        self.run_values = values
-        self.run_started_at = datetime.now()
-        self.run_repo_id = make_repo_id(values.dataset_name, self.hf_user, self.run_started_at)
-        stream_port = self._open_stream_server() if self.defaults.display_data and values.cameras else None
-        cmd = build_record_command(values, self.run_repo_id, self.defaults, stream_port=stream_port)
+    def _say(self, text: str) -> None:
+        if self.vars["voice"].get():
+            self.voice.say(text)
 
+    def _launch(self, cmd: list[str], summary: str) -> None:
+        """Start *cmd*, feeding its output to the terminal pane, and lock the form."""
+        self.announcer = Announcer()
         self._clear_log()
-        self._append_log(f"$ lerobot-record ... --dataset.repo_id={self.run_repo_id}\n", "cmd", echo=False)
+        self._append_log(f"$ {summary}\n", "cmd", echo=False)
         _echo(f"$ {shlex.join(cmd)}\n")
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         self.proc = subprocess.Popen(  # nosec B603 - argv list built from our own config
@@ -683,9 +773,44 @@ class TeleopGui:
             env=env,
         )
         threading.Thread(target=self._pump_output, args=(self.proc,), daemon=True).start()
-
         self._set_inputs_enabled(False)
-        self._show_live_view(values)
+
+    def _start_replay(self) -> None:
+        values, error = self._read_replay_form()
+        if values is None or error:
+            return
+        self.run_values = None
+        self.run_replay = values
+        self.run_tool = "lerobot-replay"
+        self.run_repo_id = values.repo_id
+
+        summary = f"lerobot-replay ... --dataset.repo_id={values.repo_id} --dataset.episode={values.episode}"
+        self._launch(build_replay_command(values), summary)
+        self._show_live_view(
+            {},
+            f"{values.repo_id}  ·  episode {values.episode}",
+            "Connecting to the robot and loading the dataset...",
+        )
+        self.button.configure(text="Stop replay", style="Stop.TButton", state="normal")
+        self._set_status("Replay running  ·  output in the terminal below")
+        self.hint.configure(text=REPLAY_HELP)
+        self.root.focus_set()
+        self.root.after(100, self._poll)
+
+    def _start(self) -> None:
+        values, error = self._read_form()
+        if values is None or error:
+            return
+        self.run_values = values
+        self.run_replay = None
+        self.run_tool = "lerobot-record"
+        self.run_started_at = datetime.now()
+        self.run_repo_id = make_repo_id(values.dataset_name, self.hf_user, self.run_started_at)
+        stream_port = self._open_stream_server() if self.defaults.display_data and values.cameras else None
+        cmd = build_record_command(values, self.run_repo_id, self.defaults, stream_port=stream_port)
+
+        self._launch(cmd, f"lerobot-record ... --dataset.repo_id={self.run_repo_id}")
+        self._show_live_view(values.cameras, self.run_repo_id, "Connecting to the robot and cameras...")
         self.button.configure(text="Stop recording", style="Stop.TButton", state="normal")
         self._set_status("Recording  ·  keys work while any window is focused")
         self.hint.configure(text=MANUAL_KEYS_HELP if values.manual_control else TIMED_KEYS_HELP)
@@ -699,13 +824,15 @@ class TeleopGui:
             self.button.configure(state="disabled")
             upload = self.run_values is not None and self.run_values.push_to_hub
             message = "Stopping...  finalizing" + (" and uploading" if upload else "") + " the dataset"
+            if self.run_replay is not None:
+                message = "Stopping the replay..."
             self._set_phase(PHASE_STOPPING, message)
             self._set_status(message)
 
     def _pump_output(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stdout is not None
         for line in proc.stdout:
-            _echo(line)  # mirror to the terminal run-gui was started from, as it arrives
+            _echo(line)  # mirror to the terminal lerobot-run-gui was started from, as it arrives
             self.lines.put(line)
         self.lines.put(None)
 
@@ -725,13 +852,16 @@ class TeleopGui:
             self._append_log(line, "error" if is_error else None, echo=False)
             if (phase := phase_from_log(line, manual)) is not None:
                 self._set_phase(*phase)
+            if (sentence := self.announcer(line)) is not None:
+                self._say(sentence)
         if finished:
             self._on_finished()
         else:
             self.root.after(100, self._poll)
 
     def _save_session(self) -> Path | None:
-        assert self.run_values is not None
+        if self.run_values is None:  # a replay collects nothing
+            return None
         return write_session_file(
             HF_LEROBOT_HOME / self.run_repo_id, self.run_values, self.run_repo_id, self.run_started_at
         )
@@ -746,13 +876,22 @@ class TeleopGui:
             self._append_log(f"\nOperator info saved to {session}\n", "cmd")
         self._show_setup_view()
         self._set_inputs_enabled(True)
-        self.button.configure(text="Start recording", style="Primary.TButton")
+        self.button.configure(style="Primary.TButton")
         self._refresh()
         # SIGINT exits with -2 / 130; that's a normal Stop, not a failure.
-        if code in (0, -signal.SIGINT, 130):
+        if self.run_replay is not None and code == 0:
+            self._set_status(f"Replayed episode {self.run_replay.episode} of {self.run_repo_id}")
+            self._say("Replay finished")
+        elif self.run_replay is not None and code in (-signal.SIGINT, 130):
+            self._set_status("Replay stopped")
+            self._say("Replay stopped")
+        elif code in (0, -signal.SIGINT, 130):
             self._set_status(f"Done: {self.run_repo_id}")
+            uploaded = self.run_values is not None and self.run_values.push_to_hub
+            self._say("Dataset saved and uploaded" if uploaded else "Dataset saved")
         else:
-            self._set_status(f"lerobot-record exited with code {code}. See the terminal.", error=True)
+            self._say(f"{self.run_tool} failed. Check the terminal")
+            self._set_status(f"{self.run_tool} exited with code {code}. See the terminal.", error=True)
             if not self.terminal_maximized:
                 self._toggle_terminal()
 
@@ -762,7 +901,7 @@ class TeleopGui:
         self.log.configure(state="disabled")
 
     def _append_log(self, text: str, tag: str | None = None, echo: bool = True) -> None:
-        """Show *text* in the GUI terminal and, with *echo*, in the terminal run-gui was started from."""
+        """Show *text* in the GUI terminal and, with *echo*, in the terminal lerobot-run-gui was started from."""
         if echo:
             _echo(text)
         at_bottom = self.log.yview()[1] >= 0.999
@@ -776,9 +915,15 @@ class TeleopGui:
         if self.proc is not None and self.proc.poll() is None:
             from tkinter import messagebox
 
-            if not messagebox.askyesno(
-                "Recording in progress", "Stop the recording and quit? The dataset will be finalized first."
-            ):
+            title, question = (
+                ("Replay in progress", "Stop the replay and quit?")
+                if self.run_replay is not None
+                else (
+                    "Recording in progress",
+                    "Stop the recording and quit? The dataset will be finalized first.",
+                )
+            )
+            if not messagebox.askyesno(title, question):
                 return
             self.proc.send_signal(signal.SIGINT)
             self.proc.wait()
@@ -792,7 +937,7 @@ class TeleopGui:
 
 
 def main() -> None:
-    """Entry point of ``run-gui``."""
+    """Entry point of ``lerobot-run-gui``."""
     TeleopGui().run()
 
 

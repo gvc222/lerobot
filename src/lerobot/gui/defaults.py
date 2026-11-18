@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Starting values for the ``run-gui`` form.
+"""Starting values for the ``lerobot-run-gui`` form.
 
 The robot / teleop / camera / episode fields of the form are pre-filled from here, so edit these to
 match your rig and you won't have to retype them.  Camera type and fps are not in the form: each
@@ -57,6 +57,8 @@ class GuiDefaults:
     reset_time_s: float = 10
     # Show the camera feeds in the GUI while recording (lerobot-record --display_mode=stream).
     display_data: bool = True
+    # Speak the recording state ("Recording episode 3", "Episode 3 saved as success", ...).
+    voice: bool = True
 
 
 DEFAULTS = GuiDefaults()

@@ -17,7 +17,7 @@
 Selects a visualization backend at runtime via a display-mode string (e.g. a ``--display_mode`` CLI
 flag) so callers never branch on the backend. The concrete implementations live in
 :mod:`lerobot.utils.rerun_visualization`, :mod:`lerobot.utils.foxglove_visualization` and
-:mod:`lerobot.utils.stream_visualization` (JPEG frames over TCP to a local viewer such as ``run-gui``); importing
+:mod:`lerobot.utils.stream_visualization` (JPEG frames over TCP to a local viewer such as ``lerobot-run-gui``); importing
 this module does not import ``rerun`` or ``foxglove`` (each backend imports its SDK lazily behind a
 ``require_package`` guard).
 """
@@ -44,7 +44,7 @@ def init_visualization(
     For ``"rerun"``, ``ip``/``port`` point at an optional remote Rerun server. For ``"foxglove"``,
     ``ip`` is the interface to bind the WebSocket server to (``127.0.0.1`` for local only, ``0.0.0.0``
     for all interfaces) and ``port`` is its port. For ``"stream"``, ``ip``/``port`` are where the viewer
-    (e.g. ``run-gui``) listens for JPEG frames.
+    (e.g. ``lerobot-run-gui``) listens for JPEG frames.
     """
 
     if display_mode == "rerun":

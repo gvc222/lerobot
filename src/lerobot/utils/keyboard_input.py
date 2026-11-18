@@ -451,11 +451,12 @@ def init_labeling_keyboard_listener():
     """Initialize the keyboard listener for untimed, labeled recording (``--manual_control=true``).
 
     Same backends as :func:`init_keyboard_listener`, but the keys depend on ``events["phase"]``,
-    which the recording loop sets to ``"idle"``, ``"recording"`` or ``"awaiting_label"``:
+    which the recording loop sets to ``"idle"``, ``"recording"`` or ``"saving"``:
 
     * idle: Space starts an episode.
-    * recording: Space ends the episode; Left discards it.
-    * awaiting_label: Space / ``r`` / ``f`` label it success / recovery / failure; Left discards it.
+    * recording: Space / ``r`` / ``f`` end the episode as success / recovery / failure; Left
+      discards it.
+    * saving: only quit is handled, so keys pressed while an episode is saved don't leak into the next.
     * any phase: Esc / ``q`` stops recording.
 
     Every handled key also sets ``exit_early`` so the running ``record_loop`` returns.
@@ -463,7 +464,7 @@ def init_labeling_keyboard_listener():
     Returns:
         A tuple ``(listener, events)`` where ``listener`` exposes ``.stop()`` or is ``None``, and
         ``events`` holds the flags of :func:`init_keyboard_listener` plus ``phase``,
-        ``start_episode``, ``stop_episode`` and ``episode_label`` (an :data:`EPISODE_LABELS` value).
+        ``start_episode`` and ``episode_label`` (an :data:`EPISODE_LABELS` value).
     """
     events = {
         "exit_early": False,
@@ -471,7 +472,6 @@ def init_labeling_keyboard_listener():
         "stop_recording": False,
         "phase": "idle",
         "start_episode": False,
-        "stop_episode": False,
         "episode_label": None,
     }
     label_keys = {
@@ -485,21 +485,18 @@ def init_labeling_keyboard_listener():
         phase = events["phase"]
         if key in ("esc", "q"):
             apply_recording_control("esc", events)
-        elif key == "left" and phase in ("recording", "awaiting_label"):
+        elif key == "left" and phase == "recording":
             apply_recording_control("left", events)
         elif phase == "idle" and key == "space":
             events["start_episode"] = True
             events["exit_early"] = True
-        elif phase == "recording" and key == "space":
-            events["stop_episode"] = True
-            events["exit_early"] = True
-        elif phase == "awaiting_label" and key in label_keys:
+        elif phase == "recording" and key in label_keys:
             events["episode_label"] = label_keys[key]
             events["exit_early"] = True
         # other keys (incl. n/right, and left while idle) are intentionally ignored
 
     listener = create_key_listener(
         on_key,
-        controls_help="Space=start/stop, then Space/r/f=success/recovery/failure, Left=discard, q=quit",
+        controls_help="Space=start, then Space/r/f=end as success/recovery/failure, Left=discard, q=quit",
     )
     return listener, events

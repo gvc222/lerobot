@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Display-free logic of ``run-gui``.
+"""Display-free logic of ``lerobot-run-gui``.
 
-Parses and validates the form, builds the ``lerobot-record`` command and reads its log output.  Kept
-free of Tk so it can be tested headless.
+Parses and validates the forms, builds the ``lerobot-record`` / ``lerobot-replay`` commands and reads
+their log output.  Kept free of Tk so it can be tested headless.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ STREAM_HOST = "127.0.0.1"
 MANUAL_EPISODE_CAP = 1_000_000
 
 _DATASET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 _CAMERA_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESOLUTION_RE = re.compile(r"^\s*(\d+)\s*[x×]\s*(\d+)\s*$")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -55,10 +56,11 @@ ROBOT_REQUIRED_FIELDS = frozenset({"port", "id", "cameras"})
 TELEOP_REQUIRED_FIELDS = frozenset({"port", "id"})
 
 MANUAL_KEYS_HELP = (
-    "Space start / stop episode  ·  then Space = success, r = recovery, f = failure  ·  "
+    "Space = start episode  ·  then end it with Space = success, r = recovery, f = failure  ·  "
     "Left = discard  ·  q = quit"
 )
 TIMED_KEYS_HELP = "Right = end episode early  ·  Left = re-record  ·  Esc / q = stop"
+REPLAY_HELP = "The arm moves right after Start  ·  Support it: torque turns off when the replay ends or stops"
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,17 @@ class FormValues:
     num_episodes: int
     episode_time_s: float
     reset_time_s: float
+
+
+@dataclass(frozen=True)
+class ReplayValues:
+    """What the operator entered in the replay form, parsed."""
+
+    robot_type: str
+    robot_port: str
+    robot_id: str
+    repo_id: str
+    episode: int
 
 
 # ---- type choices --------------------------------------------------------------------------------
@@ -224,6 +237,36 @@ def form_error(values: FormValues, hf_user: str | None) -> str | None:
     return None
 
 
+def parse_replay_form(fields: dict[str, Any]) -> ReplayValues:
+    """Build :class:`ReplayValues` from raw widget values.  Raises ValueError with a user-facing message."""
+    episode = str(fields["replay_episode"]).strip()
+    if not episode.isdecimal():
+        raise ValueError("Episode must be a whole number, starting at 0.")
+    return ReplayValues(
+        robot_type=fields["robot_type"].strip(),
+        robot_port=fields["robot_port"].strip(),
+        robot_id=fields["robot_id"].strip(),
+        repo_id=fields["replay_repo_id"].strip(),
+        episode=int(episode),
+    )
+
+
+def replay_form_error(values: ReplayValues) -> str | None:
+    """Return why the replay form can't be submitted yet, or None when it's ready."""
+    required = [
+        (values.repo_id, "Enter a dataset repo id."),
+        (values.robot_type, "Choose a robot type."),
+        (values.robot_port, "Enter the robot port."),
+        (values.robot_id, "Enter the robot id."),
+    ]
+    for value, message in required:
+        if not value:
+            return message
+    if not _REPO_ID_RE.match(values.repo_id):
+        return "Dataset repo id must look like <user>/<dataset>."
+    return None
+
+
 # ---- command line --------------------------------------------------------------------------------
 
 
@@ -287,8 +330,28 @@ def build_record_command(
         f"--dataset.reset_time_s={values.reset_time_s}",
         f"--dataset.push_to_hub={str(values.push_to_hub).lower()}",
         f"--dataset.tags={json.dumps([f'operator:{values.operator}'])}",
+        # Without this, `save_episode` encodes the videos while nothing drives the robot, which freezes it.
+        "--dataset.streaming_encoding=true",
+        "--dataset.encoder_threads=2",
         *display,
         f"--manual_control={str(values.manual_control).lower()}",
+        # The GUI speaks the state itself (see Announcer), with the episode number and label.
+        "--play_sounds=false",
+    ]
+
+
+def build_replay_command(values: ReplayValues) -> list[str]:
+    """The ``lerobot-replay`` invocation.  Replay only sends actions, so no cameras are opened."""
+    return [
+        sys.executable,
+        "-m",
+        "lerobot.scripts.lerobot_replay",
+        f"--robot.type={values.robot_type}",
+        f"--robot.port={values.robot_port}",
+        f"--robot.id={values.robot_id}",
+        f"--dataset.repo_id={values.repo_id}",
+        f"--dataset.episode={values.episode}",
+        "--play_sounds=false",
     ]
 
 
@@ -341,41 +404,92 @@ def clean_log_line(line: str) -> str:
     return line
 
 
-# Phases shown over the camera feeds, driven by what lerobot-record logs (log_say -> logging.info).
+# Phases shown in the live view, driven by what the subprocess logs (log_say -> logging.info).
 PHASE_STARTING = "starting"
 PHASE_READY = "ready"
 PHASE_RECORDING = "recording"
-PHASE_LABEL = "label"
 PHASE_RESET = "reset"
+PHASE_REPLAYING = "replaying"
 PHASE_STOPPING = "stopping"
 
 _PHASE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"Recording episode (\d+)"), PHASE_RECORDING),
-    (re.compile(r"Label the episode"), PHASE_LABEL),
     (re.compile(r"Saved (success|recovery|failure)\. .*?(\d+) total"), PHASE_READY),
     (re.compile(r"\bDiscarded\b"), PHASE_READY),
     (re.compile(r"Reset the environment"), PHASE_RESET),
     (re.compile(r"Re-record episode"), PHASE_RESET),
     (re.compile(r"Stop recording"), PHASE_STOPPING),
+    (re.compile(r"Replaying episode"), PHASE_REPLAYING),
 ]
 
 
 def phase_from_log(line: str, manual: bool) -> tuple[str, str] | None:
-    """``(phase, message)`` if *line* marks a recording phase change, else None."""
+    """``(phase, message)`` if *line* marks a recording or replay phase change, else None."""
     for pattern, phase in _PHASE_PATTERNS:
         match = pattern.search(line)
         if not match:
             continue
         if phase == PHASE_RECORDING:
-            stop = "Space to stop, Left to discard" if manual else "Right to end early, Left to re-record"
+            stop = (
+                "End with Space = success, r = recovery, f = failure  ·  Left = discard"
+                if manual
+                else "Right to end early, Left to re-record"
+            )
             return phase, f"Recording episode {match.group(1)}  ·  {stop}"
-        if phase == PHASE_LABEL:
-            return phase, "Label it:  Space = success  ·  r = recovery  ·  f = failure  ·  Left = discard"
         if phase == PHASE_READY and match.groups():
             return phase, f"Saved {match.group(1)} ({match.group(2)} total)  ·  Space to start the next one"
         if phase == PHASE_READY:
             return phase, "Discarded  ·  Space to start the next episode"
         if phase == PHASE_RESET:
             return phase, "Reset the scene"
+        if phase == PHASE_REPLAYING:
+            return phase, "Replaying the episode on the robot"
         return phase, "Stopping...  finalizing the dataset"
     return None
+
+
+# ---- voice announcements -------------------------------------------------------------------------
+
+_SAY_RECORDING = re.compile(r"Recording episode (\d+)")
+_SAY_LABELED = re.compile(r"Saved (success|recovery|failure)\.")
+_SAY_SAVED = re.compile(r"Saved episode (\d+)")
+_SAY_DISCARDED = re.compile(r"\bDiscarded\b")
+_SAY_RESET = re.compile(r"Reset the environment")
+_SAY_RERECORD = re.compile(r"Re-record episode")
+_SAY_STOP = re.compile(r"Stop recording")
+_SAY_REPLAY = re.compile(r"Replaying episode")
+
+
+class Announcer:
+    """Turns ``lerobot-record`` / ``lerobot-replay`` log lines into short sentences to speak.
+
+    Remembers the episode being recorded, so the end of an episode can say which one it was.
+    """
+
+    def __init__(self) -> None:
+        """Start with no episode seen yet."""
+        self.episode: int | None = None
+
+    def _ep(self) -> str:
+        return f"Episode {self.episode}" if self.episode is not None else "Episode"
+
+    def __call__(self, line: str) -> str | None:
+        """The sentence to speak for *line*, or None."""
+        if match := _SAY_RECORDING.search(line):
+            self.episode = int(match.group(1))
+            return f"Recording episode {self.episode}"
+        if match := _SAY_LABELED.search(line):  # manual mode
+            return f"Recording stopped. {self._ep()} saved as {match.group(1)}"
+        if _SAY_DISCARDED.search(line):  # manual mode
+            return f"Recording stopped. {self._ep()} discarded"
+        if _SAY_RESET.search(line):  # timed mode: the save comes after the reset phase
+            return "Recording stopped. Reset the scene"
+        if _SAY_RERECORD.search(line):
+            return f"{self._ep()} discarded. Recording it again"
+        if match := _SAY_SAVED.search(line):  # timed mode
+            return f"Episode {match.group(1)} saved"
+        if _SAY_STOP.search(line):
+            return "Recording stopped. Saving the dataset"
+        if _SAY_REPLAY.search(line):
+            return "Replaying"
+        return None

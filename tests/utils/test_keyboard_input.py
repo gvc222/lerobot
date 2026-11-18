@@ -245,15 +245,12 @@ def _labeling_events(monkeypatch, phase):
     "phase,key,flags",
     [
         ("idle", "space", {"start_episode": True, "exit_early": True}),
-        ("recording", "space", {"stop_episode": True, "exit_early": True}),
+        ("recording", "space", {"episode_label": EPISODE_LABELS["success"], "exit_early": True}),
+        ("recording", "r", {"episode_label": EPISODE_LABELS["recovery"], "exit_early": True}),
+        ("recording", "F", {"episode_label": EPISODE_LABELS["failure"], "exit_early": True}),
         ("recording", "left", {"rerecord_episode": True, "exit_early": True}),
-        ("awaiting_label", "space", {"episode_label": EPISODE_LABELS["success"], "exit_early": True}),
-        ("awaiting_label", "r", {"episode_label": EPISODE_LABELS["recovery"], "exit_early": True}),
-        ("awaiting_label", "F", {"episode_label": EPISODE_LABELS["failure"], "exit_early": True}),
-        ("awaiting_label", "left", {"rerecord_episode": True, "exit_early": True}),
         ("idle", "q", {"stop_recording": True, "exit_early": True}),
         ("recording", "esc", {"stop_recording": True, "exit_early": True}),
-        ("awaiting_label", "q", {"stop_recording": True, "exit_early": True}),
     ],
 )
 def test_labeling_listener_key_routing(monkeypatch, phase, key, flags):
@@ -269,10 +266,8 @@ def test_labeling_listener_key_routing(monkeypatch, phase, key, flags):
         ("idle", "left"),  # nothing to discard yet
         ("idle", "r"),
         ("idle", "n"),
-        ("recording", "r"),  # r/f only label once the episode has stopped
         ("recording", "n"),
         ("recording", "right"),
-        ("awaiting_label", "n"),
     ],
 )
 def test_labeling_listener_ignores_keys_outside_their_phase(monkeypatch, phase, key):

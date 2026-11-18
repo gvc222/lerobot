@@ -21,23 +21,28 @@ import pytest
 
 from lerobot.gui.form import (
     MANUAL_EPISODE_CAP,
-    PHASE_LABEL,
     PHASE_READY,
     PHASE_RECORDING,
+    PHASE_REPLAYING,
+    Announcer,
     CameraValues,
     FormValues,
     build_record_command,
+    build_replay_command,
     clean_log_line,
     form_error,
     load_type_choices,
     make_repo_id,
     parse_form,
+    parse_replay_form,
     parse_resolution,
     phase_from_log,
+    replay_form_error,
     suggested_mount,
     write_session_file,
 )
 from lerobot.scripts.lerobot_record import RecordConfig
+from lerobot.scripts.lerobot_replay import ReplayConfig
 
 pytestmark = [pytest.mark.dataset, pytest.mark.hardware]
 
@@ -171,6 +176,8 @@ def test_command_parses_into_record_config(manual, upload):
     assert cfg.dataset.push_to_hub is upload
     assert cfg.dataset.repo_id == repo_id
     assert cfg.dataset.no_stamp is True
+    # Otherwise saving an episode freezes the robot while the videos encode.
+    assert cfg.dataset.streaming_encoding is True
     assert cfg.dataset.single_task == values.task
     # Manual mode is uncapped: lerobot-record only stops on q / Stop.
     assert cfg.dataset.num_episodes == (MANUAL_EPISODE_CAP if manual else 7)
@@ -181,6 +188,59 @@ def test_command_parses_into_record_config(manual, upload):
     assert (cfg.robot.cameras["top"].width, cfg.robot.cameras["top"].height) == (1280, 720)
     # Cameras not in defaults.py borrow type / fps from its first camera.
     assert cfg.robot.cameras["side"].fps == 30
+
+
+RAW_REPLAY_FIELDS = {
+    "robot_type": "so101_follower",
+    "robot_port": "/dev/ttyACM1",
+    "robot_id": "boinkie_follower_arm",
+    "replay_repo_id": " boinkie/santa_ducky_20261103_145920 ",
+    "replay_episode": " 3 ",
+}
+
+
+def test_parse_replay_form():
+    values = parse_replay_form(RAW_REPLAY_FIELDS)
+    assert values.repo_id == "boinkie/santa_ducky_20261103_145920"
+    assert values.episode == 3
+    assert replay_form_error(values) is None
+
+
+@pytest.mark.parametrize("episode", ["", "-1", "1.5", "first"])
+def test_parse_replay_form_rejects_bad_episode(episode):
+    with pytest.raises(ValueError, match="Episode"):
+        parse_replay_form({**RAW_REPLAY_FIELDS, "replay_episode": episode})
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"replay_repo_id": ""}, "repo id"),
+        # What an unset $HF_USER expands to.
+        ({"replay_repo_id": "/santa_ducky_20261103_145920"}, "<user>/<dataset>"),
+        ({"replay_repo_id": "santa_ducky"}, "<user>/<dataset>"),
+        ({"replay_repo_id": "boinkie/santa ducky"}, "<user>/<dataset>"),
+        ({"robot_port": ""}, "robot port"),
+        ({"robot_id": ""}, "robot id"),
+    ],
+)
+def test_replay_form_error(overrides, message):
+    error = replay_form_error(parse_replay_form({**RAW_REPLAY_FIELDS, **overrides}))
+    assert error is not None and message in error
+
+
+def test_replay_command_parses_into_replay_config():
+    fields = {**RAW_REPLAY_FIELDS, "robot_type": "koch_follower"}
+    cmd = build_replay_command(parse_replay_form(fields))
+    assert cmd[1:3] == ["-m", "lerobot.scripts.lerobot_replay"]
+
+    cfg = draccus.parse(ReplayConfig, args=cmd[3:])
+    assert cfg.robot.type == "koch_follower"
+    assert cfg.robot.port == "/dev/ttyACM1"
+    assert cfg.robot.id == "boinkie_follower_arm"
+    assert cfg.robot.cameras == {}
+    assert cfg.dataset.repo_id == "boinkie/santa_ducky_20261103_145920"
+    assert cfg.dataset.episode == 3
 
 
 def test_write_session_file(tmp_path):
@@ -213,11 +273,11 @@ def test_clean_log_line():
 @pytest.mark.parametrize(
     "line, manual, phase, text",
     [
-        ("INFO 2026-11-02 utils.py:150 Recording episode 3", True, PHASE_RECORDING, "Space to stop"),
+        ("INFO 2026-11-02 utils.py:150 Recording episode 3", True, PHASE_RECORDING, "r = recovery"),
         ("INFO 2026-11-02 utils.py:150 Recording episode 3", False, PHASE_RECORDING, "Right to end"),
-        ("INFO ... Label the episode: space=success  r=recovery", True, PHASE_LABEL, "r = recovery"),
         ("INFO ... Saved failure. 2 success, 0 recovery, 1 failure, 3 total", True, PHASE_READY, "3 total"),
         ("INFO ... Discarded", True, PHASE_READY, "Discarded"),
+        ("INFO 2026-11-03 utils.py:150 Replaying episode", False, PHASE_REPLAYING, "Replaying"),
     ],
 )
 def test_phase_from_log(line, manual, phase, text):
@@ -229,3 +289,38 @@ def test_phase_from_log(line, manual, phase, text):
 
 def test_phase_from_log_ignores_other_lines():
     assert phase_from_log("INFO connecting to /dev/ttyACM1", manual=True) is None
+
+
+def test_announcer_names_the_episode_in_manual_mode():
+    say = Announcer()
+    assert say("INFO utils.py:150 Recording episode 4") == "Recording episode 4"
+    assert say("INFO ... Saved recovery. 2 success, 1 recovery, 0 failure, 3 total") == (
+        "Recording stopped. Episode 4 saved as recovery"
+    )
+    assert say("INFO utils.py:150 Recording episode 5") == "Recording episode 5"
+    assert say("INFO ... Discarded") == "Recording stopped. Episode 5 discarded"
+    assert say("INFO ... Stop recording") == "Recording stopped. Saving the dataset"
+    assert say("INFO connecting to /dev/ttyACM1") is None
+
+
+def test_announcer_timed_mode():
+    say = Announcer()
+    assert say("INFO ... Recording episode 0") == "Recording episode 0"
+    assert say("INFO ... Reset the environment") == "Recording stopped. Reset the scene"
+    assert say("INFO ... Saved episode 0") == "Episode 0 saved"
+    assert say("INFO ... Recording episode 1") == "Recording episode 1"
+    assert say("INFO ... Re-record episode") == "Episode 1 discarded. Recording it again"
+
+
+def test_commands_leave_speech_to_the_gui():
+    cmd = build_record_command(_values(), "u/x")
+    assert draccus.parse(RecordConfig, args=cmd[3:]).play_sounds is False
+    fields = {
+        "robot_type": "so101_follower",
+        "robot_port": "/dev/x",
+        "robot_id": "f",
+        "replay_repo_id": "u/d",
+        "replay_episode": "0",
+    }
+    replay_cmd = build_replay_command(parse_replay_form(fields))
+    assert draccus.parse(ReplayConfig, args=replay_cmd[3:]).play_sounds is False

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``--display_mode=stream``: send camera frames as JPEG over TCP to a local viewer (e.g. ``run-gui``).
+"""``--display_mode=stream``: send camera frames as JPEG over TCP to a local viewer (e.g. ``lerobot-run-gui``).
 
 The viewer listens on ``display_ip:display_port``; :func:`init_stream` connects to it.  The record
 loop only hands over references to the latest frames (:func:`log_stream_data` never blocks); a

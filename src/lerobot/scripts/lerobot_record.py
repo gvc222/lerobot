@@ -40,9 +40,9 @@ lerobot-record \\
 
 Untimed episodes, each labeled success / recovery / failure (stored in the per-frame
 ``episode_label`` column: 0 / 1 / 2), with ``--manual_control=true``.  Space starts an episode,
-Space stops it, then Space / r / f saves it as success / recovery / failure; Left discards
-it and q quits.  ``episode_time_s`` and ``reset_time_s`` are ignored, and ``num_episodes``
-caps the number of saved episodes:
+then Space / r / f ends and saves it as success / recovery / failure; Left discards it and
+q quits.  ``episode_time_s`` and ``reset_time_s`` are ignored, and ``num_episodes`` caps the
+number of saved episodes:
 
 ```shell
 lerobot-record \\
@@ -113,6 +113,7 @@ lerobot-record \\
 
 import logging
 import math
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -208,7 +209,7 @@ class RecordConfig:
     # Display all cameras on screen
     display_data: bool = False
     # Visualization backend used when display_data is True: "rerun", "foxglove" or "stream"
-    # ("stream" sends JPEG camera frames to a local viewer listening on display_ip:display_port, e.g. run-gui).
+    # ("stream" sends JPEG camera frames to a local viewer listening on display_ip:display_port, e.g. lerobot-run-gui).
     display_mode: str = "rerun"
     # For "rerun": IP of a remote server to send to. For "foxglove": interface to bind the WebSocket
     # server to (127.0.0.1 for local only, 0.0.0.0 for all interfaces).
@@ -441,18 +442,45 @@ def _existing_label_counts(dataset: LeRobotDataset) -> dict[int, int]:
 _LABEL_NAMES = {v: k for k, v in EPISODE_LABELS.items()}
 
 
+def _save_episode_with_live_teleop(dataset: LeRobotDataset, loop_kwargs: dict) -> None:
+    """Save the buffered episode while a background thread keeps teleoperating the robot.
+
+    `save_episode` can take seconds (flushing the video encoder, writing parquet, computing
+    stats).  Run on the control thread, it leaves the follower frozen in place while the
+    operator keeps moving the leader, and it then jumps to catch up.  The background loop
+    writes nothing (``dataset=None``) and gets its own events dict, so it neither touches the
+    dataset being saved nor swallows the operator's key presses.
+    """
+    stop_events = {"exit_early": False}
+    errors: list[BaseException] = []
+
+    def drive() -> None:
+        try:
+            record_loop(**{**loop_kwargs, "events": stop_events}, control_time_s=math.inf)
+        except BaseException as e:  # noqa: BLE001 - re-raised on the caller's thread
+            errors.append(e)
+
+    thread = threading.Thread(target=drive, name="teleop-during-save", daemon=True)
+    thread.start()
+    try:
+        dataset.save_episode()
+    finally:
+        stop_events["exit_early"] = True
+        thread.join()
+    if errors:
+        raise errors[0]
+
+
 def _clear_manual_events(events: dict) -> None:
-    events.update(
-        exit_early=False, rerecord_episode=False, start_episode=False, stop_episode=False, episode_label=None
-    )
+    events.update(exit_early=False, rerecord_episode=False, start_episode=False, episode_label=None)
 
 
 def _record_manual(
     cfg: RecordConfig, dataset: LeRobotDataset, events: dict, timer: CycleTimer, loop_kwargs: dict
 ) -> None:
-    """Untimed, keyboard-driven recording: idle -> recording -> awaiting_label -> save or discard.
+    """Untimed, keyboard-driven recording: idle -> recording -> save or discard.
 
-    Every phase runs :func:`record_loop` at the same fps with the teleop live, so the operator
+    The key that ends an episode also labels it.  Both phases run :func:`record_loop` at the same fps with the teleop live, so the operator
     feels no difference between them; only the recording phase writes frames.  Keys are
     handled by :func:`~lerobot.utils.keyboard_input.init_labeling_keyboard_listener`.
     """
@@ -479,15 +507,9 @@ def _record_manual(
             timer=timer,
         )
 
-        # An episode stopped before its first frame has nothing to label: treat it as discarded.
-        if dataset.has_pending_frames() and not (events["stop_recording"] or events["rerecord_episode"]):
-            _clear_manual_events(events)
-            events["phase"] = "awaiting_label"
-            logging.info("Label the episode: space=success  r=recovery  f=failure  (left=discard)")
-            record_loop(**loop_kwargs, control_time_s=math.inf)
-
         label = events["episode_label"]
-        if label is None:  # discarded with Left, quit before labeling, or empty
+        # An episode ended before its first frame has nothing to save: treat it as discarded.
+        if label is None or not dataset.has_pending_frames():  # discarded with Left, or quit
             dataset.clear_episode_buffer()
             timer.log_episode_summary("discarded episode")
             timer.restart()
@@ -496,7 +518,8 @@ def _record_manual(
             continue
 
         _set_episode_label(dataset, label)
-        dataset.save_episode()
+        events["phase"] = "saving"  # the listener ignores everything but quit until the next idle phase
+        _save_episode_with_live_teleop(dataset, loop_kwargs)
         counts[label] += 1
         saved += 1
         timer.log_episode_summary(f"episode {episode_index}")
@@ -633,20 +656,20 @@ def record(
             )
 
         with VideoEncodingManager(dataset):
+            loop_kwargs = {
+                "robot": robot,
+                "events": events,
+                "fps": cfg.dataset.fps,
+                "teleop_action_processor": teleop_action_processor,
+                "robot_action_processor": robot_action_processor,
+                "robot_observation_processor": robot_observation_processor,
+                "teleop": teleop,
+                "single_task": cfg.dataset.single_task,
+                "display_data": cfg.display_data,
+                "display_mode": cfg.display_mode,
+                "display_compressed_images": display_compressed_images,
+            }
             if cfg.manual_control:
-                loop_kwargs = {
-                    "robot": robot,
-                    "events": events,
-                    "fps": cfg.dataset.fps,
-                    "teleop_action_processor": teleop_action_processor,
-                    "robot_action_processor": robot_action_processor,
-                    "robot_observation_processor": robot_observation_processor,
-                    "teleop": teleop,
-                    "single_task": cfg.dataset.single_task,
-                    "display_data": cfg.display_data,
-                    "display_mode": cfg.display_mode,
-                    "display_compressed_images": display_compressed_images,
-                }
                 _record_manual(cfg, dataset, events, timer, loop_kwargs)
             else:
                 recorded_episodes = 0
@@ -701,8 +724,9 @@ def record(
                         timer.restart()
                         continue
 
-                    dataset.save_episode()
+                    _save_episode_with_live_teleop(dataset, loop_kwargs)
                     recorded_episodes += 1
+                    logging.info(f"Saved episode {episode_index}")
                     # Close the window on the episode just saved.  The digest is emitted on
                     # the next episode's first tick, so the reset phase, `save_episode` and
                     # the spoken prompts in between are excluded from the cadence instead of

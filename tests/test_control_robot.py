@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import re
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -28,9 +29,16 @@ from lerobot.datasets.utils import EPISODES_DIR
 from lerobot.processor import make_default_processors
 from lerobot.robots import make_robot_from_config
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
-from lerobot.scripts.lerobot_record import RecordConfig, _existing_label_counts, record, record_loop
+from lerobot.scripts.lerobot_record import (
+    RecordConfig,
+    _existing_label_counts,
+    _save_episode_with_live_teleop,
+    record,
+    record_loop,
+)
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
+from lerobot.teleoperators import make_teleoperator_from_config
 from lerobot.utils.utils import unwrap_scalar
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
@@ -217,11 +225,12 @@ def test_record_forwards_compressed_images_setting_to_reset_phase(tmp_path):
     with patch("lerobot.scripts.lerobot_record.record_loop", wraps=record_loop) as mock_record_loop:
         record(cfg)
 
-    # Recording episode 0, resetting, then recording episode 1 should all use the same
-    # image representation so visualization backends do not receive mixed message types.
+    # Recording episode 0, resetting, then recording episode 1 — and the teleop loops that run
+    # while each episode is saved — should all use the same image representation so
+    # visualization backends do not receive mixed message types.
     assert [
         call.kwargs.get("display_compressed_images", False) for call in mock_record_loop.call_args_list
-    ] == [True, True, True]
+    ] == [True] * 5
 
 
 def test_record_loop_without_a_teleoperator_paces_and_terminates():
@@ -263,8 +272,8 @@ def test_record_loop_without_a_teleoperator_paces_and_terminates():
 def _run_manual_session(cfg: RecordConfig, label_keys: list[str]):
     """Drive `record(cfg)` in manual mode, pressing keys from inside `record_loop`.
 
-    Idle presses Space, recording runs for 0.1 s (ending a phase is what Space does), and
-    each label phase presses the next key of *label_keys*.
+    Idle presses Space, and each recording phase runs for 0.1 s and then presses the next key of
+    *label_keys*.
     """
     dispatch = {}
     keys = iter(label_keys)
@@ -274,12 +283,13 @@ def _run_manual_session(cfg: RecordConfig, label_keys: list[str]):
         return None
 
     def fake_record_loop(**kwargs):
-        phase = kwargs["events"]["phase"]
-        if phase == "idle":
+        phase = kwargs["events"].get("phase")
+        if phase is None:  # the teleop loop that runs while an episode is saved
+            record_loop(**kwargs)
+        elif phase == "idle":
             dispatch["on_key"]("space")
-        elif phase == "recording":
-            record_loop(**{**kwargs, "control_time_s": 0.1})
         else:
+            record_loop(**{**kwargs, "control_time_s": 0.1})
             dispatch["on_key"](next(keys))
 
     with (
@@ -333,7 +343,7 @@ def test_record_manual_labels_episodes_and_resumes_counts(tmp_path):
     assert _existing_label_counts(dataset) == {0: 1, 1: 2, 2: 1}
 
 
-def test_record_manual_quit_while_awaiting_label_discards_the_episode(tmp_path):
+def test_record_manual_quit_while_recording_discards_the_episode(tmp_path):
     dataset_cfg = DatasetRecordConfig(
         repo_id=DUMMY_REPO_ID,
         single_task="Dummy task",
@@ -352,3 +362,44 @@ def test_record_manual_quit_while_awaiting_label_discards_the_episode(tmp_path):
     dataset = _run_manual_session(cfg, ["space", "q"])
 
     assert dataset.meta.total_episodes == 1
+
+
+def test_robot_keeps_following_the_teleop_while_an_episode_is_saved():
+    # Regression: `save_episode` ran on the control thread, so the follower froze between episodes.
+    robot = make_robot_from_config(MockRobotConfig())
+    robot.connect()
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    teleop = make_teleoperator_from_config(MockTeleopConfig())
+    teleop.connect()
+    sent = threading.Event()
+    real_send_action = robot.send_action
+
+    def send_action(action):
+        sent.set()
+        return real_send_action(action)
+
+    robot.send_action = send_action
+
+    class SlowDataset:
+        def save_episode(self):
+            assert sent.wait(timeout=5), "no action reached the robot while the episode was saved"
+
+    events = {"exit_early": False, "stop_recording": False, "rerecord_episode": False}
+    try:
+        _save_episode_with_live_teleop(
+            SlowDataset(),
+            {
+                "robot": robot,
+                "events": events,
+                "fps": 30,
+                "teleop_action_processor": teleop_action_processor,
+                "robot_action_processor": robot_action_processor,
+                "robot_observation_processor": robot_observation_processor,
+                "teleop": teleop,
+            },
+        )
+    finally:
+        robot.disconnect()
+        teleop.disconnect()
+    # The background loop must not consume the operator's events.
+    assert events == {"exit_early": False, "stop_recording": False, "rerecord_episode": False}
